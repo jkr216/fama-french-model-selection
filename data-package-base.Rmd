@@ -1,0 +1,73 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, comment= NA)
+
+library(tidyverse)
+library(broom)
+library(tidyquant)
+library(timetk)
+library(caret)
+library(recipes)
+library(rsample)
+library(yardstick)
+library(parsnip)
+library(probably)
+library(dials)
+
+symbols <- c("SPY", "EFA", "IJS", "EEM", "AGG")
+
+
+# The prices object will hold our daily price data.
+prices <- 
+  getSymbols(symbols, src = 'yahoo', 
+             from = "2007-12-31",
+             to = "2018-12-31",
+             auto.assign = TRUE, 
+             warnings = FALSE) %>% 
+  map(~Ad(get(.))) %>% 
+  reduce(merge) %>%
+  `colnames<-`(symbols)
+
+
+asset_returns_long <-  
+  prices %>% 
+  tk_tbl(preserve_index = TRUE, rename_index = "date") %>%
+  gather(asset, returns, -date) %>% 
+  group_by(asset) %>%  
+  mutate(returns = (log(returns) - log(lag(returns)))) %>% 
+  na.omit()
+
+factors_data_address <- 
+"http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_Daily_CSV.zip"
+
+factors_csv_name <- "Global_5_Factors_Daily.csv"
+
+temp <- tempfile()
+
+download.file(
+  # location of file to be downloaded
+  factors_data_address,
+  # where we want R to store that file
+  temp, 
+  quiet = TRUE)
+
+
+Global_5_Factors <- 
+  read_csv(unz(temp, factors_csv_name), skip = 6 ) %>%
+  rename(date = X1, MKT = `Mkt-RF`) %>%
+  mutate(date = ymd(parse_date_time(date, "%Y%m%d")))%>%
+  mutate_if(is.numeric, funs(. / 100)) %>% 
+  select(-RF)
+
+data_joined_tidy <- 
+  asset_returns_long %>%
+  left_join(Global_5_Factors, by = "date") %>% 
+  na.omit()
+```

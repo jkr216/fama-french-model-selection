@@ -1,0 +1,559 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Model introspection; data linneage; white boxing models; he calls it 'introspecting'; lime, dalex; 
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(tidyquant)
+library(riingo)
+library(timetk)
+library(tibbletime)
+library(highcharter)
+library(htmltools)
+library(almanac)
+library(slide)
+library(pins)
+
+
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, comment= NA)
+```
+
+
+```{r}
+
+etf_ticker_sector <- tibble(
+  ticker = c("XLY", "XLP", "XLE",	
+          "XLF", "XLV",	"XLI", "XLB", 
+          "XLK", "XLU", "XLRE", 
+          "SPY"),	
+  sector = c("Consumer Discretionary", "Consumer Staples", "Energy", 
+          "Financials", "Health Care", "Industrials", "Materials", 
+          "Information Technology", "Utilities", "Real Estate",
+          "Market")
+)
+
+etf_ticker_sector
+```
+
+
+Now we want to import the daily prices for 2018 for these tickers. We could use `getSymbols()` to access yahoo! Finance as we have done for the last 3 years, but let's do something crazy and explore a new data source, the excellent [tiingo](https://tiingo.com)  which we access via the [riingo](https://cran.r-project.org/web/packages/riingo/riingo.pdf) package.
+The workhorse function to grab price data is `riingo_prices`, to which we need to supply our tickers and a `start_date`/`end_date` pair. 
+
+Let's start with the tickers, which we have already saved in the `ticker` column of `etf_ticker_sector`. That wasn't really necssary. We could have just created a vector called `tickers_vector` by calling `tickers_vector = c("ticker1", "ticker2", ...)` and then passed that vector straight to `riingo_prices`. But I didn't want to do that because I prefer to get my data to a tibble first and, as we'll see, it will make it easier to add back in our sector labels, since they are aligned with our tickers in one object.
+
+To pass our `ticker` column to `riingo_prices()`, we start with our tibble `etf_ticker_sector` and then pipe it to `pull(ticker)`. That will create a vector from the `ticker` column. The `pull()` function is very useful in these situations where we want to pipe or extract a column as a vector.
+
+Here's the result of pulling the tickers: 
+
+```{r}
+  etf_ticker_sector %>%
+  pull(ticker)
+```
+
+Then we set our key for use this session with:
+
+```{r, include=FALSE}
+
+# Need an API key for tiingo
+
+riingo_set_token("97d26898fe27141ef524c1fa3ab0d3f0c3c59b09")
+```
+
+```{r, eval = FALSE}
+
+# Need an API key for tiingo
+
+riingo_set_token("your API key here")
+```
+
+Import prices from `tiingo`.
+
+
+```{r}
+etf_prices <-
+  etf_ticker_sector %>%
+  pull(ticker) %>% 
+  riingo_prices(., 
+                start_date = "2010-01-01",
+                end_date = Sys.Date()) %>% 
+  mutate(date = ymd(date))
+```
+
+Let's calculate rolling 50-day and 200-day average for SPY.
+
+```{r}
+etf_prices %>% 
+  group_by(ticker) %>% 
+  filter(ticker == "SPY") %>% 
+  mutate(sma_50 = slide_dbl(close, mean, .before = 50, .complete = TRUE),
+         sma_200 = slide_dbl(close, mean, .before = 200, .complete = TRUE)) %>% 
+  select(date, sma_50, sma_200)
+```
+
+We should see NAs in the first 50 rows of `sma_50` and the first 200 rows of `sma_200`.
+
+
+Let's plot. 
+
+```{r}
+rolling_average_plot <- 
+etf_prices %>% 
+  group_by(ticker) %>% 
+  filter(ticker == "SPY") %>% 
+  mutate(sma_50 = slide_dbl(close, mean, .before = 50, .complete = TRUE),
+         sma_200 = slide_dbl(close, mean, .before = 200, .complete = TRUE)) %>% 
+  select(date, close, sma_50, sma_200) %>% 
+  ggplot(aes(x = date)) + 
+  geom_line(aes(y = close), color = "purple", linetype = "dotted") +
+  geom_line(aes(y = sma_50), color = "cornflowerblue", linetype = "solid") + 
+  geom_line(aes(y = sma_200), color = "green", linetype = "solid") +
+  scale_x_date(breaks = scales::pretty_breaks(n = 10)) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.title = element_text(hjust = .5)) +
+  labs(x = "Daily Volume", title = "SMA 50 v. SMA 200", y = "prices ($)")
+
+rolling_average_plot
+```
+
+How have volumes behaved throughout this time period?
+
+```{r}
+volume_plot <- 
+etf_prices %>% 
+  group_by(ticker) %>% 
+  filter(ticker == "SPY") %>% 
+ # mutate(sma_50 = slide_dbl(close, mean, .before = 50, .complete = TRUE)) 
+  ggplot(aes(x = date)) + 
+  geom_col(aes(y = volume), color = "pink", alpha = .5) +
+  scale_x_date(breaks = scales::pretty_breaks(n = 10)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5)) +
+  labs(y = "volume")
+```
+
+```{r}
+etf_prices %>% 
+  group_by(ticker) %>% 
+  filter(ticker == "SPY") %>% 
+  mutate(sma_50 = slide_dbl(close, mean, .before = 50, .complete = TRUE),
+         sma_200 = slide_dbl(close, mean, .before = 200, .complete = TRUE)) %>% 
+  select(date, close, sma_50, sma_200, volume) %>% 
+  ggplot(aes(x = date)) + 
+  geom_line(aes(y = close), color = "purple", linetype = "dotted") +
+  geom_line(aes(y = sma_50), color = "cornflowerblue", linetype = "solid") + 
+  geom_line(aes(y = sma_200), color = "green", linetype = "solid") +
+  geom_col(aes(y = volume), color = "pink", alpha = .5) +
+  scale_y_continuous(sec.axis = sec_axis(~. * 1000000)) +
+  theme_minimal()
+```
+
+
+
+```{r}
+library(gridExtra)
+library(cowplot)
+library(plotly)
+
+ggplotly(
+plot_grid(rolling_average_plot, volume_plot, align = "v", nrow = 2, rel_heights = c(3/4, 1/4))
+)
+
+subplot(rolling_average_plot, volume_plot, nrows = 2, margin = 0.04, heights = c(0.6, 0.4), titleX = TRUE, titleY = TRUE)
+```
+
+I'm curious if BLS reports or holidays affect volumes and want to add a flag to the charts on the day of BLS reports and the day *after* any market holidays...Let's use `almanac` in a way that Davis never intended.
+
+
+```{r}
+bls_reports <- 
+monthly(since = "2010-01-01") %>%
+  recur_on_interval(1) %>%
+  recur_on_wday("Friday", nth = 1) %>% 
+  sch_seq("2010-01-01", "2020-03-01", .) %>% 
+  tibble(nfp_release_dates = .,
+         bls_flag = 1)
+```
+
+
+<!-- ism_reports <-  -->
+<!--   monthly(since = "2010-01-01") %>% -->
+<!--   recur_on_interval(1) %>% -->
+<!--   recur_on_mday(1) %>% -->
+<!--   sch_seq("2010-01-01", "2020-03-01", .) %>%  -->
+<!--   sch_adjust(., on_us_holidays_and_weekends, 1) %>%  -->
+<!--   tibble(ism_release_dates = ., -->
+<!--          flab = 1)  -->
+
+```{r}
+on_us_holidays <- calendar_usa_federal()
+
+day_after <- 
+tibble(
+  post_holiday = sch_seq("2010-01-01", "2019-10-01", on_us_holidays) + days(1),
+  holiday_flag = .3
+)
+
+```
+
+question on Connect and how packages are available to all users? seems more that they want Cole to take a look and make sure all is good with their package repos on RSC. they have rspm set up but they were not pointing RSC to it, still had it wired to CRAN and Cole walked them through that by trying a package install live. Luck (pronounced 'Luke') was driving for HSBC. Monika Deshmukh set up the call and then handed off to Luck. Cole went command by command to get them the packages installed and honestly went above and beyond what we can normally do but it's feeling like these large financials need extra attention consistently. This team seems pretty dedicated to getting this working but we can see it's taken them months to get to this point. They are close and this call hopefully gets them there. Fix yum install. Then they need to get dependencies installed, then get Connect installed so can start testing
+
+
+
+```{r}
+etf_prices_date_flags <- 
+etf_prices %>% 
+  group_by(ticker) %>% 
+  mutate(sma_50 = slide_dbl(close, mean, .before = 50, .complete = TRUE),
+         sma_200 = slide_dbl(close, mean, .before = 200, .complete = TRUE)) %>% 
+  select(date, close, volume, sma_50, sma_200) %>% 
+  left_join(bls_reports, by = c("date" = "nfp_release_dates")) %>% 
+  left_join(day_after, by = c("date" = "post_holiday")) 
+
+etf_prices_date_flags %>% 
+  filter(ticker ==  "SPY") %>% 
+  ggplot(aes(x = date)) + 
+  geom_col(aes(y = volume), color = "pink", alpha = .5) +
+  geom_point(data = etf_prices_date_flags %>% filter(ticker == "SPY" & bls_flag == 1), aes(date, volume), color = "orange") +
+  geom_point(data = etf_prices_date_flags %>% filter(ticker == "SPY" & holiday_flag == .3), aes(date, volume), color = "black") +
+  scale_x_date(breaks = scales::pretty_breaks(n = 10)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5)) +
+  labs(y = "volume")
+```
+
+```{r}
+volume_plot_flags <-
+etf_prices_date_flags %>% 
+  filter(ticker ==  "SPY") %>% 
+  ggplot(aes(x = date)) + 
+  geom_col(aes(y = volume), color = "pink", alpha = .5) +
+  geom_point(data = etf_prices_date_flags %>% filter(ticker == "SPY" & bls_flag == 1), aes(date, volume), color = "orange") +
+  geom_point(data = etf_prices_date_flags %>% filter(ticker == "SPY" & holiday_flag == .3), aes(date, volume), color = "black") +
+  scale_x_date(breaks = scales::pretty_breaks(n = 10)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5)) +
+  labs(y = "volume")
+```
+
+
+```{r}
+subplot(rolling_average_plot, volume_plot_flags, nrows = 2, margin = 0.04, heights = c(0.6, 0.4), titleX = TRUE, titleY = TRUE)
+```
+
+```{r}
+# etf_prices_date_flags
+price_updatemenus <- list(
+  
+  list(
+    active = -1,
+    type= 'buttons',
+    buttons = list(
+      list(
+        label = "All",
+        method = "update",
+        args = list(list(visible = c(TRUE, TRUE, TRUE)),
+                    list(title = "All"))),
+      list(
+        label = "BLS",
+        method = "update",
+        args = list(list(visible = c(TRUE, TRUE, FALSE)),
+                    list(title = "BLS"))),
+      list(
+        label = "Holidays",
+        method = "update",
+        args = list(list(visible = c(TRUE, FALSE, TRUE)),
+                    list(title = "Holidays"))))
+  )
+)
+
+rolling_average_plot <- 
+  (
+etf_prices_date_flags %>% 
+  filter(ticker == "XLY") %>% 
+  ggplot(aes(x = date)) + 
+  geom_line(aes(y = close), color = "purple", linetype = "dotted") +
+  geom_line(aes(y = sma_50), color = "cornflowerblue", linetype = "solid") + 
+  geom_line(aes(y = sma_200), color = "green", linetype = "solid") +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  scale_x_date(breaks = scales::pretty_breaks(n = 10)) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.title = element_text(hjust = .5)) +
+  labs(x = "Daily Volume", title = "SMA 50 v. SMA 200", y = "prices ($)")
+) %>% 
+  ggplotly() %>% 
+  layout(title = "Volume", 
+         updatemenus = price_updatemenus)
+
+# chosen_ticker <- input$ticker
+
+volume_updatemenus <- list(
+  
+  list(
+    active = -1,
+    type= 'buttons',
+    buttons = list(
+      list(
+        label = "All",
+        method = "update",
+        args = list(list(visible = c(TRUE, TRUE, TRUE)),
+                    list(title = "All"))),
+      list(
+        label = "BLS",
+        method = "update",
+        args = list(list(visible = c(TRUE, TRUE, FALSE)),
+                    list(title = "BLS"))),
+      list(
+        label = "Holidays",
+        method = "update",
+        args = list(list(visible = c(TRUE, FALSE, TRUE)),
+                    list(title = "Holidays"))))
+  )
+)
+
+volume_plot_flags <-
+(etf_prices_date_flags %>% 
+  filter(ticker ==  "XLY") %>% 
+  ggplot(aes(x = date)) + 
+  geom_col(aes(y = volume, text = paste("date:", date, "<br> volume:", volume)), color = "pink", alpha = .5) +
+  geom_point(data = etf_prices_date_flags %>% filter(ticker == "XLY" & bls_flag == 1), aes(date, volume, text = paste("date:", date, "<br> volume:", volume)), color = "orange") +
+  geom_point(data = etf_prices_date_flags %>% filter(ticker == "XLY" & holiday_flag == .3), aes(date, volume, text = sprintf("date:", date, "<br>volume: %s", formattable::comma(volume, digits = 0))), color = "black") +
+  scale_x_date(breaks = scales::pretty_breaks(n = 10)) +
+   scale_y_continuous(label = scales::unit_format(unit = "m", scale = 1e-6)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5)) +
+  labs(y = "volume") 
+ ) %>%
+  ggplotly(tooltip = "text") %>%
+  layout(title = "Volume", 
+         updatemenus = volume_updatemenus)
+
+subplot(rolling_average_plot, volume_plot_flags, nrows = 2, margin = 0.04, heights = c(0.6, 0.4), titleX = TRUE, titleY = TRUE)
+
+write_rds(etf_prices_date_flags, "etf_prices_date_flags.RDS")
+```
+
+
+```{r}
+p1 <- 
+etf_prices_date_flags %>% 
+  filter(ticker ==  "XLY") %>% 
+plot_ly(., x = ~date, y = ~close, name = 'closing price', type = 'scatter', mode = 'lines', line = list(width = 1)) %>%
+  add_trace(y = ~sma_200, name = 'sma 200', line = list(color = 'rgb(66, 245, 245)', width = 1, dash = 'dash')) %>%
+  add_trace(y = ~sma_50, name = 'sma 50',line = list(color = 'rgb(245, 66, 242)', width = 1, dash = 'dash'))
+
+
+p2 <- 
+  plot_ly(economics, x = ~date, y = ~uempmed) %>%
+  add_lines(name = ~"uempmed")
+
+subplot(p1, p2, nrows = 2)
+etf_prices_date_flags %>% 
+  filter(ticker ==  "XLY") %>%
+plot_ly() %>%
+  add_trace(x = ~date, y = ~volume, type = 'bar', name = 'daily volume',
+            marker = list(color = '#C9EFF9'),
+            hoverinfo = "text",
+            text = ~paste(volume, 'shares traded')) %>%
+  add_trace(x = ~date, y = ~close, type = 'scatter', mode = 'lines', name = 'close', yaxis = 'y2',
+            line = list(color = '#45171D'),
+            hoverinfo = "text",
+            text = ~paste('$', close)) %>%
+  add_trace(x = ~date, y = ~volume, size = ~holiday_flag, mode = 'markers', name = 'holiday',
+            line = list(color = '#C9EFF9'),
+            hoverinfo = "text",
+            text = ~paste('$', volume)) %>%
+  layout(title = 'sma 50 sma 200 daily volume',
+         xaxis = list(title = ""),
+         yaxis = list(side = 'left', title = 'volume', showgrid = FALSE, zeroline = FALSE),
+         yaxis2 = list(side = 'right', overlaying = "y", title = 'price', showgrid = FALSE, zeroline = FALSE))
+```
+
+
+
+```{r}
+lm_func <- function(x){
+  lm(open ~ lagged_volume, data = x)
+}
+
+etf_prices %>% 
+ #group_by(ticker) %>% 
+  # slice(1) %>% 
+  filter(ticker == "XLY") %>% 
+  arrange(date) %>% 
+  mutate(#lagged_volume = lag(volume),
+    roll_reg = slide_index(., date,  ~lm(open ~ volume, .x), .before = days(19), .complete = TRUE)) %>% 
+  select(date, roll_reg, volume)
+
+single_group_rolling_regression <- function(.x, .y) {
+  regressions <- slide_index(
+    .x = .x, 
+    .i = .x$date, 
+    .f = ~lm(open ~ close, data = .x), 
+    .before = 5, # 20 days 
+    .complete = TRUE # complete windows only
+  )
+  
+  mutate(.x, regressions = regressions)
+}
+
+etf_prices %>% 
+ group_by(ticker) %>% 
+  mutate(date = ymd(date)) %>% 
+  group_modify(single_group_rolling_regression) %>% 
+  filter(ticker == "SPY") %>% 
+  mutate(fit = map(regressions, broom::tidy))
+
+etf_prices %>% 
+  mutate(date = ymd(date)) %>%
+ nest(-ticker) %>% 
+  slice(1:3) %>% 
+  mutate(regressions = map(data, single_group_rolling_regression),
+         tidied = map(regressions, broom::tidy)) 
+
+  mutate(
+    regression = rolling_regressions,
+      open ~ close, 
+      date = date, 
+      open = open,
+      close = close,
+      .before = 20,
+      .complete = TRUE
+    )
+  #)
+  # slice(1) %>% 
+  # mutate(#lagged_volume = lag(volume),den ~ volume, .x), .before = 19, .complete = TRUE))) %>% 
+  # select(date, roll_reg, volume)
+```
+
+```{r}
+library(slide)
+library(dplyr)
+library(tibbletime)
+data("FANG")
+  
+# `...` is used to turn the vectors we can get from mutate() into
+# a data frame corresponding to a single group's rows
+rolling_regression <- function(.formula, 
+                               ..., 
+                               .before = 0L, 
+                               .after = 0L, 
+                               .complete = FALSE) {
+  
+  single_group_data <- tibble(...)
+  
+  slide_index(
+    .x = single_group_data, 
+    .i = single_group_data$date, 
+    .f = ~lm(.formula, data = .x), 
+    .before = .before,
+    .after = .after,
+    .complete = .complete
+  )
+}
+  
+etf_prices %>%
+  group_by(ticker) %>%
+  mutate(date = ymd(date)) %>% 
+  filter(ticker == "SPY" | ticker == "XLY") %>% 
+  mutate(
+    regression = rolling_regression(
+      open ~ close + volume, 
+      date = date, 
+      open = open,
+      close = close,
+      volume = volume,
+      .before = 20,
+      .complete = TRUE
+    )
+  )
+```
+
+```{r}
+ymd("2019-03-12") + days(30) + days(30) + days(30)
+
+on_weekends <- weekly(since = "2000-01-01") %>% 
+  recur_on_weekends()
+
+daily(since = "2018-12-12") %>% 
+  recur_on_interval(30) %>% 
+  sch_seq("2018-12-12", "2019-12-31", .) %>% 
+  sch_adjust(., on_weekends, adjustment = days(3))
+  wday(label = T)
+```
+
+
+```{r}
+etf_prices %>% 
+  group_by(ticker) %>% 
+  # slice(1) %>% 
+  mutate(sma_50 = slide_index_dbl(close, date, mean, .before = days(5), .complete = TRUE),
+         sma_200 = slide_index_dbl(close, date, mean, .before = days(20), .complete = TRUE)) %>% 
+  select(date, sma_50, sma_200) %>% 
+  slice(1:3)
+
+quarter_flags <- 
+  monthly(since = "2010-01-01") %>%
+  recur_on_interval(3) %>%
+  recur_on_wday("Monday") %>% 
+  sch_seq("2000-01-01", "2002-01-01", .)
+
+monthly(since = "1999-01-01") %>%
+  recur_on_interval(3) %>%
+  recur_on_wday("Friday") %>%
+  recur_on_position(-1) %>% 
+  sch_seq("2010-01-01", "2019-11-07", .)
+```
+
+
+```{r}
+
+bls_reports <- 
+monthly(since = "2010-01-01") %>%
+  recur_on_interval(1) %>%
+  recur_on_wday("Friday") %>% 
+  recur_on_position(1) %>%
+  sch_seq("2010-01-01", "2020-03-01", .) %>% 
+  tibble(nfp_release_dates = .,
+         bls_flag = 1)
+
+
+ism_reports <- 
+  monthly(since = "2010-01-01") %>%
+  recur_on_interval(1) %>%
+  recur_on_mday(1) %>%
+  sch_seq("2010-01-01", "2020-03-01", .) %>% 
+  sch_adjust(., on_us_holidays_and_weekends, 1) %>% 
+  tibble(ism_release_dates = .,
+         flab = 1) 
+
+on_us_holidays <- calendar_usa_federal()
+
+day_after <- 
+tibble(
+  post_holiday = sch_seq("2010-01-01", "2019-10-01", on_us_holidays) + days(1),
+  holiday_flag = 1
+)
+
+new_data <- 
+etf_prices %>%
+  mutate(date = ymd(date)) %>% 
+  left_join(bls_reports, by = c("date" = "nfp_release_dates")) %>% 
+  left_join(day_after, by = c("date" = "post_holiday"))
+library(plotly)
+ggplotly(
+new_data %>%  
+filter(ticker == "SPY") %>% 
+  ggplot() +
+  geom_col(aes(x = date, y = volume), show.legend = FALSE) +
+  geom_point(data = new_data %>% filter(ticker == "SPY" & bls_flag == 1), aes(date, volume), color = "cornflowerblue") +
+  geom_point(data = new_data %>% filter(ticker == "SPY" & holiday_flag == 1), aes(date, volume), color = "pink")
+)
+```
+

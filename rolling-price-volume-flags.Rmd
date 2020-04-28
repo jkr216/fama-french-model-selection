@@ -1,0 +1,187 @@
+---
+title: "Funds app"
+runtime: shiny
+output: 
+  flexdashboard::flex_dashboard:
+    vertical_layout: fill
+    orientation: rows
+    source_code: embed
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyquant)
+library(tidyverse)
+library(plotly)
+library(scales)
+library(formattable)
+
+# Load up our data from the Notebook
+# Or do we prefer public data? 
+# Or from a database? 
+etf_prices_date_flags <- read_rds("etf_prices_date_flags.RDS")
+
+# funds <- c("TLT", "AGG", "SPY", "EEM", "UUP", "VNQ", "IJS")
+
+funds <- etf_prices_date_flags %>% 
+  group_by(ticker) %>% 
+  slice(1) %>% 
+  pull(ticker)
+
+```
+
+
+Sidebar {.sidebar}
+================================
+
+```{r}
+helpText("Choose the Fund.")
+
+selectInput("fund", 
+             label = "Select a Fund", 
+             choices = funds, 
+             selected = "SPY", 
+            width = "20px")
+
+
+ 
+actionButton("go", "Submit", icon = icon("cog", lib = "glyphicon"))
+ 
+# for display in raw data page
+selected_fund <- eventReactive(input$go, {
+  etf_prices_date_flags %>% 
+    filter(ticker == input$fund)
+}, ignoreNULL = FALSE) 
+
+
+```
+
+Page 1
+================================
+
+Row 1
+---------------------------------------
+
+### Rolling prices
+
+```{r}
+renderPlotly({
+  
+ price_update_menus <- list(
+  
+  list(
+    active = -1,
+    type= 'buttons',
+    buttons = list(
+      list(
+        label = "All",
+        method = "update",
+        args = list(list(visible = c(TRUE, TRUE, TRUE)),
+                    list(title = "All"))),
+       list(
+        label = "price",
+        method = "update",
+        args = list(list(visible = c(TRUE, FALSE, FALSE)),
+                    list(title = "sma 50"))),
+      list(
+        label = "sma 50",
+        method = "update",
+        args = list(list(visible = c(FALSE, TRUE, FALSE)),
+                    list(title = "sma 50"))),
+      list(
+        label = "sma 200",
+        method = "update",
+        args = list(list(visible = c(FALSE, FALSE, TRUE)),
+                    list(title = "sma 200"))))
+  )
+)
+  
+rolling_average_plot <- 
+  (selected_fund() %>% 
+  ggplot(aes(x = date)) + 
+  geom_line(aes(y = close), color = "purple", linetype = "dotted") +
+  geom_line(aes(y = sma_50), color = "cornflowerblue", linetype = "solid") + 
+  geom_line(aes(y = sma_200), color = "green", linetype = "solid") +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  scale_x_date(breaks = scales::pretty_breaks(n = 10)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5)) +
+  labs(x = "date", title = "SMA 50 v. SMA 200", y = "prices ($)")
+) %>% 
+  ggplotly() %>%
+  layout(updatemenus = price_update_menus)
+
+rolling_average_plot
+# volume_plot_flags <-
+# (selected_fund() %>% 
+#   ggplot(aes(x = date)) + 
+#   geom_col(aes(y = volume, text = paste("date:", date, "<br> volume:", volume)), color = "pink", alpha = .5) +
+#   geom_point(data = selected_fund()  %>% filter(bls_flag == 1), aes(date, volume, text = paste("date:", date, "<br> volume:", volume)), color = "orange") +
+#   geom_point(data = selected_fund()  %>% filter(holiday_flag == .3), aes(date, volume, text = sprintf("date:", date, "<br>volume: %s", formattable::comma(volume, digits = 0))), color = "black") +
+#   scale_x_date(breaks = scales::pretty_breaks(n = 10)) +
+#    scale_y_continuous(label = scales::unit_format(unit = "m", scale = 1e-6)) +
+#   theme_minimal() +
+#   theme(plot.title = element_text(hjust = .5)) +
+#   labs(y = "volume") 
+#  ) %>%
+#   ggplotly(tooltip = "text")
+
+# subplot(rolling_average_plot, volume_plot_flags, nrows = 2, margin = 0.04, heights = c(0.6, 0.4), titleX = TRUE, titleY = TRUE)
+})
+```
+
+Row 2
+-------------------
+
+### Daily Volume
+
+```{r}
+renderPlotly({
+# chosen_ticker <- input$ticker
+
+volume_update_menus <- list(
+  
+  list(
+    active = -1,
+    type= 'buttons',
+    buttons = list(
+      list(
+        label = "All",
+        method = "update",
+        args = list(list(visible = c(TRUE, TRUE, TRUE)),
+                    list(title = "All"))),
+      list(
+        label = "BLS",
+        method = "update",
+        args = list(list(visible = c(TRUE, TRUE, FALSE)),
+                    list(title = "BLS"))),
+      list(
+        label = "Holidays",
+        method = "update",
+        args = list(list(visible = c(TRUE, FALSE, TRUE)),
+                    list(title = "Holidays"))))
+  )
+)
+
+volume_plot_flags <-
+(selected_fund() %>% 
+  ggplot(aes(x = date)) + 
+  geom_col(aes(y = volume, text = paste("date:", date, "<br> volume:", volume)), color = "pink", fill = "pink", alpha = .5) +
+  geom_point(data = selected_fund()  %>% filter(bls_flag == 1), aes(date, volume, text = paste("Jobs Report", "<br>date:", date, "<br> volume:", volume)), color = "orange") +
+  geom_point(data = selected_fund()  %>% filter(holiday_flag == .3), aes(date, volume, text = paste("Post Holiday", "<br>date:", date, "<br> volume:", volume)), color = "black") +
+  scale_x_date(breaks = scales::pretty_breaks(n = 10)) +
+   scale_y_continuous(label = scales::unit_format(unit = "m", scale = 1e-6)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5)) +
+  labs(y = "volume") 
+ ) %>%
+  ggplotly(tooltip = "text") %>%
+  layout(title = "Volume", 
+         updatemenus = volume_update_menus)
+
+volume_plot_flags
+})
+
+```
+
+

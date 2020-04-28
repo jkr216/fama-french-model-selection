@@ -1,0 +1,291 @@
+---
+title: "Rolling Origin Cumulative and Monthly"
+output: html_notebook
+---
+
+Expanding window:
+
+```{r setup}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, comment= NA)
+
+library(tidyverse)
+library(tidyquant)
+library(rsample)
+library(yardstick)
+library(broom)
+library(timetk)
+
+symbols <- c("SPY", "EFA", "IJS", "EEM", "AGG")
+
+
+# The prices object will hold our daily price data.
+prices <- 
+  getSymbols(symbols, src = 'yahoo', 
+             from = "2006-12-31",
+             to = "2017-12-31",
+             auto.assign = TRUE, 
+             warnings = FALSE) %>% 
+  map(~Ad(get(.))) %>% 
+  reduce(merge) %>%
+  `colnames<-`(symbols)
+
+
+asset_returns_long <-  
+  prices %>% 
+  tk_tbl(preserve_index = TRUE, rename_index = "date") %>%
+  gather(asset, returns, -date) %>% 
+  group_by(asset) %>%  
+  mutate(returns = (log(returns) - log(lag(returns)))) %>% 
+  na.omit()
+
+factors_data_address <- 
+"http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_Daily_CSV.zip"
+
+factors_csv_name <- "Global_5_Factors_Daily.csv"
+
+temp <- tempfile()
+
+download.file(
+  # location of file to be downloaded
+  factors_data_address,
+  # where we want R to store that file
+  temp, 
+  quiet = TRUE)
+
+
+Global_5_Factors <- 
+  read_csv(unz(temp, factors_csv_name), skip = 6 ) %>%
+  rename(date = X1, MKT = `Mkt-RF`) %>%
+  mutate(date = ymd(parse_date_time(date, "%Y%m%d")))%>%
+  mutate_if(is.numeric, funs(. / 100)) %>% 
+  select(-RF)
+
+data_joined_tidy <- 
+  asset_returns_long %>%
+  left_join(Global_5_Factors, by = "date") %>% 
+  na.omit()
+
+
+mod_form_1 <- as.formula(returns ~ MKT)
+mod_form_2 <- as.formula(returns ~ MKT + SMB + HML)
+mod_form_3 <- as.formula(returns ~ MKT + SMB + HML + RMW + CMA)
+
+ff_rolling_flex <- function(split, formula) {
+  
+  split_for_data <- analysis(split)
+  
+  ff_model <- lm(formula, data = split_for_data)
+  
+  holdout <- assessment(split)
+  
+  rmse <-
+    ff_model %>%
+    augment(newdata = holdout) %>%
+    rmse(returns, .fitted) %>%
+    pull(.estimate)
+  
+}
+```
+
+
+JKR: let's go with A different asset altogether for the expanding and then for the monthly.
+
+```{r}
+efa_ff_data <- 
+  data_joined_tidy %>% 
+  filter(asset == "EFA")
+```
+
+```{r}
+expanding_efa_splits <- rolling_origin(
+  data       = efa_ff_data,
+  initial    = 50,
+  assess     = 19,
+  cumulative = TRUE
+)
+
+expanding_efa_splits
+```
+
+
+
+```{r}
+analysis(expanding_efa_splits$splits[[1]]) %>% 
+  slice(c(1, n()))
+
+# kept 2001-01-02, expanding training size
+analysis(expanding_efa_splits$splits[[2]]) %>% 
+  slice(c(1, n()))
+```
+
+
+
+
+```{r}
+rmse_3_models_expanding <- 
+  expanding_efa_splits %>% 
+  mutate(model_1_rmse = map_dbl(expanding_efa_splits$splits,
+                       ff_rolling_flex,
+                       formula = mod_form_1),
+         model_2_rmse = map_dbl(expanding_efa_splits$splits,
+                       ff_rolling_flex,
+                       formula = mod_form_2),
+         model_3_rmse = map_dbl(expanding_efa_splits$splits,
+                       ff_rolling_flex,
+                       formula = mod_form_3))
+
+rmse_3_models_expanding %>% 
+  head()
+```
+
+```{r}
+get_assess_start_date <- function(x) 
+  min(assessment(x)$date)
+
+get_analysis_start_date <- function(x) 
+  min(analysis(x)$date)
+
+rmse_3_models_expanding_with_start_date <-
+  rmse_3_models_expanding %>%
+  mutate(assess_start_date = map(expanding_efa_splits$splits, get_assess_start_date) %>% reduce(c),
+         analysis_start_date = map(expanding_efa_splits$splits, get_analysis_start_date) %>% reduce(c)) %>%
+  select(assess_start_date, analysis_start_date, everything())
+
+rmse_3_models_expanding_with_start_date %>% 
+  ggplot(aes(x = assess_start_date, y = model_1_rmse)) +
+  geom_line()
+```
+
+
+
+Before we close, I know what you're thinking: hey, what if I don't want to split my data by number of days! I want to split my data by months and I can't use 30 days! Not to fear, `rsample` + `tibbletime` has us covered there too. We first create a new column to hold the month of each observation using `collapse_index(date, "monthly")`, then `group_by()` that column and `nest()` our data.  
+
+```{r}
+library(tibbletime)
+
+  data_joined_tidy %>% 
+  filter(asset == "SPY") %>% 
+  mutate(nest_date = tibbletime::collapse_index(date, "monthly")) %>%
+  group_by(nest_date) %>%
+  nest() 
+```
+
+ Note that we didn't lose our original daily data, we just nested it. We could reaccees it by `unnest()`ing our data: 
+ 
+```{r}
+data_joined_tidy %>% 
+  filter(asset == "SPY") %>% 
+  mutate(nest_date = tibbletime::collapse_index(date, "monthly")) %>%
+  group_by(nest_date) %>%
+  nest(-nest_date)  %>% 
+  unnest(data)
+```
+ 
+Now we want to create splits based on those months. Let's use the previous 3 months to train our model and then assess its performance on the next 1 month.
+
+```{r}
+spy_rolled_split_by_month <- 
+  data_joined_tidy %>% 
+  filter(asset == "SPY") %>% 
+  mutate(nest_date = tibbletime::collapse_index(date, "monthly")) %>%
+  group_by(nest_date) %>%
+  nest() %>% 
+  rolling_origin(initial = 3,
+                 assess =  1,
+                 cumulative = FALSE)
+
+spy_rolled_split_by_month_cum <- 
+  eem_for_roll %>% 
+  mutate(nest_date = tibbletime::collapse_index(date, "monthly")) %>%
+  group_by(nest_date) %>%
+  nest() %>% 
+  rolling_origin(initial = 3,
+                 assess =  1,
+                 cumulative = TRUE)
+
+
+spy_rolled_split_by_month
+```
+
+Now we could pipe that `sply_rolled_split_by_month` object into a similar  model flow from above. 
+
+
+```{r}
+ff_three_rmse_monthly <- function(split){
+  
+analysis_set <- 
+analysis(split)$data %>% 
+bind_rows()
+
+ff_model <- lm(returns ~ MKT + SMB + HML, data = analysis_set)
+  
+holdout <- 
+  assessment(split)$data %>% 
+  as.data.frame()
+  
+rmse <-
+    ff_model %>%
+    augment(newdata = holdout) %>%
+    rmse(returns, .fitted) %>%
+    pull(.estimate)
+}
+
+ff_three_rmse_monthly(spy_rolled_split_by_month$splits[[1]]) %>% 
+  print()
+```
+
+
+```{r}
+rmse_one_model_monthly_cum <- 
+  # can handle cumulative too
+  spy_rolled_split_by_month_cum %>% 
+  mutate(model = map_dbl(
+    .x = splits,
+    .f = ~(ff_three_rmse_monthly(.x))))
+
+rmse_one_model_monthly_cum %>% 
+  head()
+```
+
+
+```{r}
+ff_rolling_monthly_flex <- function(split, formula) {
+  
+analysis_set <- 
+analysis(split)$data %>% 
+bind_rows()
+  
+ff_model <- lm(formula, data = analysis_set)
+  
+holdout <- 
+  assessment(split)$data %>% 
+  as.data.frame()
+  
+  rmse <-
+    ff_model %>%
+    augment(newdata = holdout) %>%
+    rmse(returns, .fitted) %>%
+    pull(.estimate)
+  
+}
+
+```
+
+
+```{r}
+rmse_3_model_monthly <- 
+  spy_rolled_split_by_month %>% 
+  mutate(model_1_rmse = map_dbl(spy_rolled_split_by_month$splits,
+                       ff_rolling_monthly_flex,
+                       formula = mod_form_1),
+         model_2_rmse = map_dbl(spy_rolled_split_by_month$splits,
+                       ff_rolling_monthly_flex,
+                       formula = mod_form_2),
+         model_3_rmse = map_dbl(spy_rolled_split_by_month$splits,
+                       ff_rolling_monthly_flex,
+                       formula = mod_form_3))
+
+rmse_3_model_monthly %>% 
+  head()
+```
+

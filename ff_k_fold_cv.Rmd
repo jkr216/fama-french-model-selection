@@ -1,0 +1,341 @@
+---
+title: "rsampling Fama French"
+output: html_notebook
+---
+
+ 
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+
+# packages required for this post
+for (pkg in c('tidyquant', 'tidyverse', 'timetk', 'tibbletime', 'broom', 'rsample', 'yardstick')) 
+  if (!requireNamespace(pkg)) install.packages(pkg)
+
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, comment= NA)
+```
+
+Today we will continue our work on Fama French factor models, but more as a vehicle to explore some of the awesome stuff happening in the world of [tidy models](https://www.tidyverse.org/articles/2018/11/tidymodels-update-nov-18/). For new readers who want get familiar with Fama French before diving into this post, see [here](https://rviews.rstudio.com/2018/04/11/introduction-to-fama-french/) where we covered importing and wrangling the data, [here](https://rviews.rstudio.com/2018/05/10/rolling-fama-french/) where we covered rolling models and visualization, my most recent previous post [here](https://rviews.rstudio.com/2018/11/19/many-factor-models/) where we covered managing many models and if you're into Shiny, [this flexdashboard](http://www.reproduciblefinance.com/shiny/fama-french-three-factor/). 
+
+Our goal today is to explore k-fold cross-validation via the `rsample` package and a bit of model evaluation via the `yardstick` package. We started the model evaluation theme last time when we used `tidy()`, `glance()` and `augment()` from the `broom` package. In this post, we will  use the `rmse()` function from `yardstick`, but our main focus will be on the `vfold_cv()` function from `rsample`.  We are going to explore these tools in the context of linear regression and Fama French, which might seem weird since these tools would typically be employed in the realms of machine learning, classification and the like. We'll stay in the world of explanatory models via linear regression world for a few reasons. 
+
+First, and this is a personal preference, when getting to know a new package or methodology, I prefer to do so in a context that's already familiar. I don't want to learn about `rsample` whilst also getting to know a new data set and learning the complexities of some crazy machine learning model. Since Fama French is familiar from our previous work, we can focus on the new tools in `rsample` and `yardstick`. Second, factor models are important in finance, despite relying on good old linear regression. We won't regret time spent on factor models and we might even find creative new ways to deploy or visualize them. 
+
+The plan for today is take the same models that we ran in the last post, only this time use k-fold cross validation and bootstrapping to try to assess the quality of those models. 
+
+For that reason, we'll be working with same data as we did previously. I won't go through the logic again but in short we'll import data for daily prices of 5 ETFs, convert them to returns (have a look [here](http://www.reproduciblefinance.com/2017/09/25/asset-prices-to-log-returns/) for a refresher on that code flow), then import the 5 Fama French factor data and join it to our 5 ETF returns data. Here's the code to make that happen: 
+
+```{r}
+library(tidyverse)
+library(broom)
+library(tidyquant)
+library(timetk)
+
+symbols <- c("SPY", "EFA", "IJS", "EEM", "AGG")
+
+
+# The prices object will hold our daily price data.
+prices <- 
+  getSymbols(symbols, src = 'yahoo', 
+             from = "2012-12-31",
+             to = "2017-12-31",
+             auto.assign = TRUE, 
+             warnings = FALSE) %>% 
+  map(~Ad(get(.))) %>% 
+  reduce(merge) %>%
+  `colnames<-`(symbols)
+
+
+asset_returns_long <-  
+  prices %>% 
+  tk_tbl(preserve_index = TRUE, rename_index = "date") %>%
+  gather(asset, returns, -date) %>% 
+  group_by(asset) %>%  
+  mutate(returns = (log(returns) - log(lag(returns)))) %>% 
+  na.omit()
+
+factors_data_address <- 
+"http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_Daily_CSV.zip"
+
+factors_csv_name <- "Global_5_Factors_Daily.csv"
+
+temp <- tempfile()
+
+download.file(
+  # location of file to be downloaded
+  factors_data_address,
+  # where we want R to store that file
+  temp, 
+  quiet = TRUE)
+
+
+Global_5_Factors <- 
+  read_csv(unz(temp, factors_csv_name), skip = 6 ) %>%
+  rename(date = X1, MKT = `Mkt-RF`) %>%
+  mutate(date = ymd(parse_date_time(date, "%Y%m%d")))%>%
+  mutate_if(is.numeric, funs(. / 100)) %>% 
+  select(-RF)
+
+data_joined_tidy <- 
+  asset_returns_long %>%
+  left_join(Global_5_Factors, by = "date") %>% 
+  na.omit()
+```
+
+After running that code, we have an object called `data_joined_tidy`. It holds daily returns for 5 ETFs and the Fama French factors. Here's a look at the first row for each ETF rows.
+
+```{r}
+data_joined_tidy %>% 
+  slice(1)
+```
+
+Let's work with just one ETF for today and use `filter(asset == "AGG")` to shrink our data down to just that ETF.
+
+```{r}
+agg_ff_data <- 
+  data_joined_tidy %>% 
+  filter(asset == "AGG")
+```
+
+Okay, we're going to regress the daily returns of AGG on 1 factor, then 3 factors, then 5 factors, and we want to evaluate how well each model explains AGG's returns. That means we need a way to test the model. Last time, we looked at the adjusted r-squareds when the model was run on the entirety of AGG returns. Today, we'll evaluate the model using k-fold cross validation. That's a pretty jargon heavy phrase that isn't part of the typical finance lexicon. Let's start with the second part, `cross-validation`. Instead of running our model on the entire data set, all the daily returns of AGG, we'll run it on just part of the data set. Then test the results on the part that we did not use. Those different subsets of our original data are often called the training and the testing sets, though `rsample` calls them the `analysis` and `assessment` sets.  We validate the model results by applying them to the `assessment` data and seeing how the model performed.
+
+The `k-fold` bit refers to the fact that we're not just dividing our data into training and testing subsets, we're actually going to divide it into a bunch of groups, a `k` number of groups, or a `k` number of `folds`. One of those folds will be used as the validation set; the model will be fit on the other `k - 1 ` sets and then tested on the validation set. We're doing this with a linear model to see how well it explains the data; it's typically used in machine learning to see how well a model predicts data (we'll get there in 2019).[^1]  
+
+[^1]: For more on cross-validation, see "An Introduction to Statistical Learning", chapter 5. Available online here: http://www-bcf.usc.edu/~gareth/ISL/. 
+
+If you're like me, it will take a bit of tinkering to really grasp k-fold cross validation, but `rsample` has a great function for dividing our data into k-folds. If we wish to use 5 folds (the state of the art seems to be either 5 or 10 folds), we call the `vfold_cv()` function, pass it our data object `agg_ff_data`, and set `v = 5`.
+
+```{r}
+library(rsample)
+library(yardstick)
+set.seed(752)
+
+cved_ff<- 
+  vfold_cv(agg_ff_data, v = 5)
+
+cved_ff
+```
+
+We have an object called `cved_ff`, with a column called `splits` and a column called `id`. Let's peek at the first split.
+
+```{r}
+cved_ff$splits[[1]]
+```
+
+Three numbers. The first, 1007, is telling us how many observations are in the `analysis`. Since we have 5-folds, we should have 80% (or 4/5) of our data in the `analysis` set. The second number, 252, is telling us how many observations are in the `assessment`, which is 20% of our original data. The third number, 1259, is the total number of observations in our original data.  
+
+Next, we want to apply a model to the `analysis` set of this k-folded data and test the results on the `assessment` set. Let's start with 1 factor and run a simple linear model, `lm(returns ~ MKT)`. 
+
+We want to run it on `analysis(cved_ff$splits[[1]])` - the analysis set of out first split. 
+
+```{r}
+ff_model_test <- lm(returns ~ MKT, data = analysis(cved_ff$splits[[1]]))
+
+ff_model_test
+```
+
+Nothing too crazy so far. Now we want to test on our assessment data. The first step is to add that data to the original set. We'll use `augment()` for that task, and pass it `assessment(cved_ff$splits[[1]])`
+
+```{r}
+ff_model_test %>% 
+  augment(newdata = assessment(cved_ff$splits[[1]])) %>% 
+  head() %>% 
+  select(returns, .fitted)
+```
+
+We just added our fitted values to the `assessment` data, the subset of the data on which the model was not fit. How well did our model do when compare the fitted values to the data in the held out set? 
+
+We can use the `rmse()` function from `yardstick` to measure our model. RMSE stands for root mean-squared error. It's the sum of the squared differences between our fitted values and the actual values in the `assessment` data. A lower RMSE is better! 
+
+```{r}
+ff_model_test %>% 
+  augment(newdata = assessment(cved_ff$splits[[1]])) %>%
+  rmse(returns, .fitted)
+```
+
+Now that we've done that piece-by-piece, let's wrap the whole operation into one function. This function takes one argument, a `split` and we're going to use `pull()` so we can extract the raw number, instead of the entire `tibble` result. 
+
+```{r}
+model_one <- function(split) {
+  
+  split_for_model <- analysis(split)
+  
+  ff_model <- lm(returns ~ MKT, data = split_for_model)
+  
+  holdout <- assessment(split)
+
+  rmse <- ff_model %>%
+      augment(newdata = holdout) %>% 
+      rmse(returns, .fitted) %>% 
+      pull(.estimate)
+}
+```
+
+Now we pass it our first split.
+
+```{r}
+model_one(cved_ff$splits[[1]]) %>% 
+  head()
+```
+
+
+Now we want to apply that function to each of our 5 folds that are stored in `agg_cved_ff`. We do that with a combination of `mutate()` and `map_dbl()`. We use `map_dbl()` instead of `map` because we are returning a number here and there's not a good reason to store that number in a list column. 
+
+```{r}
+ 
+ cved_ff %>% 
+  mutate(rmse = map_dbl(cved_ff$splits, model_one))
+
+```
+
+Ok, we have 5 RMSE's since we ran the model on 5 separate `analysis` fold sets and tested on 5 separate `assessment` fold sets. Let's find the average RMSE by taking the `mean()` of the `rmse` column. That can help reduce noisiness that resulted from our random creation of those 5 folds.
+
+```{r}
+cved_ff %>% 
+  mutate(rmse = map_dbl(cved_ff$splits, model_one)) %>% 
+  summarise(mean_rse = mean(rmse)) 
+```
+
+We now have the mean RMSE after running on our model, `lm(returns ~ MKT)`, on all 5 of our folds.  
+
+That process for finding the mean RMSE can be applied other models as well. Let's suppose we wish to find the mean RMSE for two other models: `lm(returns ~ MKT + SMB + HML)`, the Fama French 3-factor model, and `lm(returns ~ MKT + SMB + HML + RMW + CMA`, the Fama French 5-factor model. By comparing the mean RMSE's, we can evaluate which model explained the returns of AGG better. Since we're just adding more and more factors, the models can be expected to get more and more accurate but again, we are exploring the `rsample` machinery and creating a template where we can pop in whatever models we wish to compare.
+
+First, let's create two new functions, that follow the exact same code pattern as above but house the 3-factor and 5-factor models.
+```{r}
+
+model_two <- function(split) {
+
+  split_for_model <- analysis(split)
+  
+  ff_model <- lm(returns ~ MKT + SMB + HML, data = split_for_model)
+
+  holdout <- assessment(split)
+
+  rmse <- 
+    ff_model %>%
+    augment(newdata = holdout) %>% 
+    rmse(returns, .fitted) %>% 
+    pull(.estimate)
+
+}
+
+model_three <- function(split) {
+  
+  split_for_model <- analysis(split)
+
+  ff_model <- lm(returns ~ MKT + SMB + HML + RMW + CMA, data = split_for_model)
+
+  holdout <- assessment(split)
+
+  rmse <- 
+    ff_model %>%
+    augment(newdata = holdout) %>% 
+    rmse(returns, .fitted) %>% 
+    pull(.estimate)
+
+}
+```
+
+Now we pass those three models to the same `mutate()` with `map_dbl()` flow that we used with just one model. The result will be three new columns of RMSE's, one for each of our three models applied to our 5 folds. 
+
+```{r}
+cved_ff %>%
+  mutate(
+    rmse_model_1 = map_dbl(
+        splits, 
+        model_one),
+    rmse_model_2 = map_dbl(
+        splits, 
+        model_two),
+    rmse_model_3 = map_dbl(
+        splits, 
+        model_three))
+```
+
+We can also find the mean RMSE for each model. 
+
+```{r}
+cved_ff %>%
+  mutate(
+    rmse_model_1 = map_dbl(
+        splits, 
+        model_one),
+    rmse_model_2 = map_dbl(
+        splits, 
+        model_two),
+    rmse_model_3 = map_dbl(
+        splits, 
+        model_three)) %>% 
+  summarise(mean_rmse_model_1 = mean(rmse_model_1), 
+            mean_rmse_model_2 = mean(rmse_model_2), 
+            mean_rmse_model_3 = mean(rmse_model_3))
+```
+
+
+That code flow worked just fine, but we had to repeat ourselves when creating the functions for each model. Let's toggle to a flow where we define three models, the ones that we wish to test with via cross-validation and RMSE, then pass those models to one function. 
+
+First, we use `as.formula()` to define our three models. 
+
+```{r}
+mod_form_1 <- as.formula(returns ~ MKT)
+mod_form_2 <- as.formula(returns ~ MKT + SMB + HML)
+mod_form_3 <- as.formula(returns ~ MKT + SMB + HML + RMW + CMA)
+```
+
+Now we write one function that takes `split` as an argument, same as above, but also takes `formula` as an argument, so we can pass it different models.  This gives us the flexibility to more easily define new models and pass them to `map` so I'll append `_flex` to the name of this function.
+
+```{r}
+
+ff_rmse_models_flex <- function(split, formula) {
+  
+  split_for_data <- analysis(split)
+  
+  ff_model <- lm(formula, data = split_for_data)
+  
+  holdout <- assessment(split)
+
+  rmse <- 
+    ff_model %>%
+    augment(newdata = holdout) %>% 
+    rmse(returns, .fitted) %>% 
+    pull(.estimate)
+  
+
+}
+```
+
+Now we use the same code flow as before, except we call `map_dbl()`, pass it our `cved_ff$splits` object, our new `flex` function called `ff_rmse_models_flex()`, and the model we wish to pass as the `formula` argument. First we pass it `mod_form_1`.
+
+```{r}
+
+cved_ff %>% 
+  mutate(rmse_model_1 = map_dbl(cved_ff$splits, 
+                          ff_rmse_models_flex,
+                          formula = mod_form_1))
+```
+Now let's pass it all three models and find the mean RMSE. 
+
+```{r}
+
+cved_ff %>% 
+  mutate(rmse_model_1 = map_dbl(cved_ff$splits, 
+                          ff_rmse_models_flex,
+                          formula = mod_form_1),
+         rmse_model_2 = map_dbl(cved_ff$splits, 
+                          ff_rmse_models_flex,
+                          formula = mod_form_2),
+         rmse_model_3 = map_dbl(cved_ff$splits, 
+                          ff_rmse_models_flex,
+                          formula = mod_form_3)) %>% 
+         summarise(mean_rmse_model_1 = mean(rmse_model_1), 
+                   mean_rmse_model_2 = mean(rmse_model_2), 
+                   mean_rmse_model_3 = mean(rmse_model_3))
+```
+
+Alright, that code flow seems a bit more flexible than our original method of writing a function to assess each model. We didn't do much hard thinking about functional form here but hopefully this provides a template where you could assess more nuanced models. We'll get into bootstrapping and time series work next week, then head to Shiny to ring in the New Year! 
+
+And, finally, a couple of public service announcements. 
+
+First, thanks to everyone who has checked out my new book! The price just got lowered for the holidays. See on [Amazon](https://www.amazon.com/Reproducible-Finance-Portfolio-Analysis-Chapman/dp/1138484032) or on the [CRC homepage](https://www.crcpress.com/Reproducible-Finance-with-R-Code-Flows-and-Shiny-Apps-for-Portfolio-Analysis/Jr/p/book/9781138484030) (okay, that was more of an announcement about my book).
+
+Second, applications are open for the [Battlefin](https://www.battlefin.com/) alternative data contest and RStudio is one of the tools you can use to analyze the data. Check it out [here](www.alternativedatacombine.com). They'll announce 25 finalists in January who will get to compete for a cash prize and connect with some quant hedge funds. Go get'em! 
+
+Thanks for reading and see you next time.

@@ -1,0 +1,349 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup,echo=FALSE}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, comment= NA)
+
+library(tidyverse)
+library(tidyquant)
+library(rsample)
+library(yardstick)
+library(broom)
+library(parsnip)
+library(highcharter)
+
+symbols <- c("SPY", "EFA", "IJS", "EEM", "AGG")
+
+
+# The prices object will hold our daily price data.
+prices <- 
+  getSymbols(symbols, src = 'yahoo', 
+             from = "2012-12-31",
+             to = "2017-12-31",
+             auto.assign = TRUE, 
+             warnings = FALSE) %>% 
+  map(~Ad(get(.))) %>% 
+  reduce(merge) %>%
+  `colnames<-`(symbols)
+
+
+asset_returns_long <-  
+  prices %>% 
+  tk_tbl(preserve_index = TRUE, rename_index = "date") %>%
+  gather(asset, returns, -date) %>% 
+  group_by(asset) %>%  
+  mutate(daily_returns = (log(returns) - log(lag(returns)))) %>% 
+  na.omit()
+
+factors_data_address <- 
+"http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_Daily_CSV.zip"
+
+factors_csv_name <- "Global_5_Factors_Daily.csv"
+
+temp <- tempfile()
+
+download.file(
+  # location of file to be downloaded
+  factors_data_address,
+  # where we want R to store that file
+  temp, 
+  quiet = TRUE)
+
+
+Global_5_Factors <- 
+  read_csv(unz(temp, factors_csv_name), skip = 6 ) %>%
+  rename(date = X1, MKT = `Mkt-RF`) %>%
+  mutate(date = ymd(parse_date_time(date, "%Y%m%d")))%>%
+  mutate_if(is.numeric, funs(. / 100)) %>% 
+  select(-RF)
+
+data_joined_tidy <- 
+  asset_returns_long %>%
+  left_join(Global_5_Factors, by = "date") %>% 
+  na.omit()
+
+```
+
+Today we will continue our exploration of developments in the world of [tidy models](https://www.tidyverse.org/articles/2018/11/tidymodels-update-nov-18/) and we will stick with our usual Fama French modeling flow to do so. For new readers who want get familiar with Fama French before diving into this post, see [here](https://rviews.rstudio.com/2018/04/11/introduction-to-fama-french/) where we covered importing and wrangling the data, [here](https://rviews.rstudio.com/2018/05/10/rolling-fama-french/) where we covered rolling models and visualization, and [here](https://rviews.rstudio.com/2018/11/19/many-factor-models/) where we covered managing many models.  If you're into Shiny, [this flexdashboard](http://www.reproduciblefinance.com/shiny/fama-french-three-factor/) might be of interest. 
+
+Let's get to it. 
+
+First, we need our data and, as usual, we'll import data for daily prices of 5 ETFs, convert them to returns (have a look [here](http://www.reproduciblefinance.com/2017/09/25/asset-prices-to-log-returns/) for a refresher on that code flow), then import the 5 Fama French factor data and join it to our 5 ETF returns data. Here's the code to make that happen (this code was covered in detail in [this post](http://www.reproduciblefinance.com/2018/06/07/fama-french-write-up-part-one/): 
+
+
+```{r, eval = FALSE}
+symbols <- c("SPY", "EFA", "IJS", "EEM", "AGG")
+
+
+# The prices object will hold our daily price data.
+prices <- 
+  getSymbols(symbols, 
+             src = 'yahoo', 
+             from = "2012-12-31",
+             to = "2017-12-31",
+             auto.assign = TRUE, 
+             warnings = FALSE) %>% 
+  map(~Ad(get(.))) %>% 
+  reduce(merge) %>%
+  `colnames<-`(symbols)
+
+
+asset_returns_long <-  
+  prices %>% 
+  tk_tbl(preserve_index = TRUE, rename_index = "date") %>%
+  gather(asset, prices, -date) %>% 
+  group_by(asset) %>%  
+  mutate(daily_returns = (log(prices) - log(lag(prices)))) %>% 
+  na.omit()
+
+factors_data_address <- 
+"http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_Daily_CSV.zip"
+
+factors_csv_name <- "Global_5_Factors_Daily.csv"
+
+temp <- tempfile()
+
+download.file(
+  # location of file to be downloaded
+  factors_data_address,
+  # where we want R to store that file
+  temp, 
+  quiet = TRUE)
+
+
+Global_5_Factors <- 
+  read_csv(unz(temp, factors_csv_name), skip = 6 ) %>%
+  rename(date = X1, MKT = `Mkt-RF`) %>%
+  mutate(date = ymd(parse_date_time(date, "%Y%m%d")))%>%
+  mutate_if(is.numeric, funs(. / 100)) %>% 
+  select(-RF)
+
+data_joined_tidy <- 
+  asset_returns_long %>%
+  left_join(Global_5_Factors, by = "date") %>% 
+  na.omit()
+```
+
+For today, let's work with just the `SPY` data by filtering our data set.
+
+```{r}
+spy_2013_2017 <- data_joined_tidy %>% 
+  filter(asset == "SPY")
+```
+
+Next, we resample this 5 years of data into smaller subsets of training and testing sets.  This is frequently done by k-fold cross validation (see [here](http://www.reproduciblefinance.com/2019/03/13/rsampling-fama-french/) for an example), where random samples are taken from the data, but since we are working with time series, we will use a time-aware technique.  The `rsample` package has a function for exactly this purpose, the `rolling_origin` function.  We covered this process extensively in this [previous post](http://www.reproduciblefinance.com/2019/03/14/rolling-origin-fama-french/). Here's the code to make it happen.
+
+```{r}
+
+rolling_origin_spy_2013_2017 <- 
+ rolling_origin(
+  data       = spy_2013_2017,
+  initial    = 100,
+  assess     = 1,
+  cumulative = FALSE
+)
+
+rolling_origin_spy_2013_2017 %>% 
+  dim()
+```
+
+We now have a data object called `rolling_origin_spy_2013_2017` that holds 1159 `splits` of data. Each split consists of an analysis data set with 100 days of return and factor data, and an assessment data set with 1 day of return and factor data. 
+
+Now we can start using that collection of data splits to fit a model on the assessment data and then test our model on the assessment data.  That means it's time to introduce a relatively new addition to the R toolchain, the `parsnip` package..
+
+`parsnip` is a unified model interface that allows us to create a model specification, set an analytical engine and then fit a model. It's a 'unified' interface in the sense that we can use the same scaffolding but insert different models, or different engines, or different modes. Let's see how that works with linear regression. 
+
+Recall that [in the previous post](add url) we piped our data into a linear model like so. 
+
+```{r}
+
+analysis(rolling_origin_spy_2013_2017$splits[[1]]) %>% 
+do(model = lm(daily_returns ~ MKT + SMB + HML + RMW + CMA, 
+      data = .)) %>% 
+tidy(model)
+```
+
+
+Now we will pipe into the `parsnip` scaffolding, which will allow us to quickly change to a different model and specification further down in the code.
+
+Since we are running a linear regression, we first create a specification with `linear_reg()`, then set the engine with `set_engine("lm")`,  and finally fit the model with `fit(five_factor_model, data = one of our splits)`
+
+```{r}
+lm_model <-
+  linear_reg() %>%
+  set_engine("lm") %>%
+  fit(daily_returns ~ MKT + SMB + HML + RMW + CMA, 
+      data = analysis(rolling_origin_spy_2013_2017$splits[[1]]))
+
+lm_model 
+```
+
+Now that we've fit the model on our test set, let's see how well it predicted the test set. We can use the `predict()` function and pass it the results of our `parnsip` code flow, along with the `assessment` split.
+
+```{r}
+
+assessment(rolling_origin_spy_2013_2017$splits[[1]]) %>% 
+  select(returns) %>% 
+  bind_cols(predict(lm_model, 
+        new_data = assessment(rolling_origin_spy_2013_2017$splits[[1]])))
+  
+
+```
+
+That worked well but now let's head to a more complex model and use
+the [ranger](https://cran.r-project.org/web/packages/ranger/ranger.pdf) package as an engine for a random forest analysis.
+
+To set up the ranger random forest model in `parsnip`, we first use `rand_forest(mode = "regression", mtry = 3, trees = 100)` to create the specification, `set_engine("ranger")` to set the engine as the `ranger` package, and `fit(daily_returns ~ MKT + SMB + HML + RMW + CMA ~ , data = analysis(rolling_origin_spy_2013_2017$splits[[1]])` to fit the 5-factor Fama French model to the 100-day sample in our first split.
+
+
+```{r}
+# Need to load the packages to be used as the random forest engine
+library(ranger)
+
+rand_forest(mode = "regression", mtry = 3, trees = 100) %>%
+  set_engine("ranger") %>%
+  fit(daily_returns ~ MKT + SMB + HML + RMW + CMA, 
+      data = analysis(rolling_origin_spy_2013_2017$splits[[1]]))
+      
+```
+
+Notice that `ranger` gives us an `OOB prediction error (MSE)` value as part of its return. `parsnip` returns to us what the underlying engine returns.
+
+Now, let's apply that random forest regression to all 1159 of our splits (recall that each split consists of 100 days of training data and 1 day of test data), so we can get an average RMSE. Warning, this will consume some resources on your machine and some time in your day. 
+
+To apply that model to our entire data set, we create a function that takes one split, passes it to our `parsnip` enabled model, and then uses the `predict` function to attempt to predict our `assessment` split.  The function also allows us to specify the number of trees and the number of variables randomly sampled at each tree split, which is set with the `mtry` argument.
+
+```{r}
+
+ranger_rf_regress <- function(mtry = 3, trees = 5, split){
+    
+    analysis_set_rf <- analysis(split)
+     
+    model <- 
+      rand_forest(mtry = mtry, trees = trees) %>%
+        set_engine("ranger") %>%
+        fit(daily_returns ~ MKT + SMB + HML + RMW + CMA, data = analysis_set_rf)
+
+    
+    assessment_set_rf <- assessment(split)
+
+
+    assessment_set_rf %>%
+      select(date, daily_returns) %>%
+      mutate(.pred = unlist(predict(model, new_data = assessment_set_rf))) %>% 
+      select(date, daily_returns, .pred)
+   
+}
+
+```
+
+Now we want to pass it our object of 1159 splits, `rolling_origin_spy_2013_2017$splits`, and we want the function to iterate over each split. For that we turn to `map_df()` from the `purrr` package, which allows us to iterate over the data object and return a data frame. `map_df()` takes the data as an argument and our function as an argument.
+
+```{r}
+ranger_results <- 
+  map_df(.x = rolling_origin_spy_2013_2017$splits,
+         ~ranger_rf_regress(mtry = 3, trees = 100, split = .x))
+```
+
+Here are the results. We now have 1159 predictions.
+
+```{r}
+ranger_results %>% 
+  head()
+```
+
+
+Notice how the date of each prediction is included since we included it in the `select()` call in our function. That will come in handy for charting later.
+
+Now we can use the `rmse()` function from `yardstick` to calculate the root mean-squared error each of our predictions (our test sets had only one observation in them because we were testing on one month, so the RMSE is not a complex calculation here, but it would be the same code pattern if we had a larger sized test set). We can then find the average rmse by calling `summarise(avg_rmse = mean(.estimate))`.
+
+```{r}
+library(yardstick)
+
+ranger_results %>%
+  group_by(date) %>% 
+  rmse(daily_returns, .pred) %>% 
+  summarise(avg_rmse = mean(.estimate))
+```
+
+We have the average rmse, let's see if the rmse's were stable over time, first with `ggplot`.
+
+
+```{r}
+ranger_results %>%
+  group_by(date) %>% 
+  rmse(daily_returns, .pred) %>% 
+  ggplot(aes(x = date, y = .estimate)) +
+  geom_point(color = "cornflowerblue") +
+  labs(y = "rmse", x = "", title = "RMSE over time via Ranger RF")
+```
+
+And via `highcharter`. 
+
+```{r}
+ranger_results %>%
+  group_by(date) %>% 
+  rmse(daily_returns, .pred) %>% 
+  hchart(., hcaes(x = date, y = .estimate),
+         type = "point") %>% 
+  hc_title(text = "RMSE over time via Ranger RF") %>% 
+  hc_yAxis(title = list(text = "RMSE"))
+```
+
+It looks like our rmse is relatively stable, except for a period in mid to late 2015. 
+
+The amazing power of `parsnip` is how efficiently we can toggle to another random forest engine. 
+Let's suppose we wished to use the [RandomForest](https://cran.r-project.org/web/packages/randomForest/randomForest.pdf) package instead of `ranger`. Here's how we could reconfigure our previous work to use a different engine.
+
+First, we'll load up the `randomForest` package because we need to load the package in order to use it as our engine. Then, we make one tweak to the original `ranger_rf_regress` function, by changing `set_engine("ranger") ` to `set_engine("randomForest") `. That's all and we're now running a random forest model using a different package.
+
+```{r}
+library(randomForest)
+
+randomForest_rf_regress <- function(mtry = 3, trees = 5, split){
+    
+    analysis_set_rf <- analysis(split)
+     
+    model <- 
+      rand_forest(mtry = mtry, trees = trees) %>%
+        set_engine("randomForest") %>%
+        fit(daily_returns ~ MKT + SMB + HML + RMW + CMA, data = analysis_set_rf)
+
+    
+    assessment_set_rf <- assessment(split)
+
+
+    assessment_set_rf %>%
+      select(date, daily_returns) %>%
+      mutate(.pred = unlist(predict(model, new_data = assessment_set_rf))) %>% 
+      select(date, daily_returns, .pred)
+   
+}
+```
+
+
+We now have a new function `randomForest_rf_regress` that uses `randomForest` as the engine for our model and can use the same code scaffolding to run that model on our 1159 splits.
+
+```{r}
+randomForest_results <- 
+  map_df(.x = rolling_origin_spy_2013_2017$splits,
+         ~randomForest_rf_regress(mtry = 3, trees = 100, split = .x))
+
+randomForest_results %>% 
+  head()
+```
+
+And we can use the same `yardstick` code to extract the `RMSE`.
+
+```{r}
+
+randomForest_results %>%
+  group_by(date) %>% 
+  rmse(daily_returns, .pred) %>% 
+  summarise(avg_rmse = mean(.estimate))
+```
+
+
+There's a lot more to explore in the `parsnip` package and the `tidymodels` collection. See you next time when we'll get into some classification! 

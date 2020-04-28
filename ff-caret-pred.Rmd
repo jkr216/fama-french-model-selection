@@ -1,0 +1,358 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+set.seed(4595)
+
+eem_2013_2017 <- 
+  data_joined_tidy_2013_2017 %>% 
+  filter(asset == "EEM") 
+
+eem_2018 <- 
+  data_joined_tidy_2018 %>% 
+  filter(asset == "EEM")
+
+spy_2013_2017 <- 
+  data_joined_tidy_2013_2017 %>% 
+  filter(asset == "SPY") %>% 
+  select(-prices)
+
+spy_2018 <- 
+  data_joined_tidy_2018 %>% 
+  filter(asset == "SPY")  %>% 
+  select(-prices)
+
+eem_tt_data_split <- initial_split(eem_2013_2017, strata = "returns", p = 0.75)
+
+eem_train <- training(eem_tt_data_split)
+eem_test  <- testing(eem_tt_data_split)
+
+rf_ff_ranger <- 
+  rand_forest(mode = "regression") %>% 
+  set_engine("ranger") %>% 
+  fit(
+    returns ~ MKT + SMB + HML,
+    data = eem_train
+  )
+
+predicted_results <- 
+  eem_test %>%
+  select(returns) %>%
+  bind_cols(
+    predict(rf_ff_ranger, new_data = eem_test)
+  )
+
+predicted_results
+
+
+eem_2018_predictions <- 
+  eem_2018 %>%
+  select(date, returns) %>%
+  bind_cols(
+    predict(rf_ff_ranger, new_data = eem_2018)
+  )
+
+eem_2018_predictions %>% 
+  mutate(signal = case_when(.pred > 0 ~ 1,
+                             TRUE ~ 0))
+```
+
+```{r}
+
+rolling_origin_spy_2013_2017 <- 
+ rolling_origin(
+  data       = spy_2013_2017,
+  initial    = 100,
+  assess     = 10,
+  cumulative = FALSE
+)
+
+mod_form_1 <- as.formula(returns ~ MKT)
+mod_form_2 <- as.formula(returns ~ MKT + SMB + HML)
+mod_form_3 <- as.formula(returns ~ MKT + SMB + HML + RMW + CMA)
+
+ff_rolling_flex <- function(split, formula) {
+  
+  split_for_data <- analysis(split)
+  
+  ff_model <- lm(formula, data = split_for_data)
+  
+  holdout <- assessment(split)
+  
+  rmse <-
+    ff_model %>%
+    augment(newdata = holdout) %>%
+    rmse(returns, .fitted) %>%
+    pull(.estimate)
+  
+}
+
+
+rmse_3_models <- 
+  rolling_origin_spy_2013_2017 %>% 
+  mutate(model_1_rmse = map_dbl(rolling_origin_spy_2013_2017$splits,
+                       ff_rolling_flex,
+                       formula = mod_form_1),
+         model_2_rmse = map_dbl(rolling_origin_spy_2013_2017$splits,
+                       ff_rolling_flex,
+                       formula = mod_form_2),
+         model_3_rmse = map_dbl(rolling_origin_spy_2013_2017$splits,
+                       ff_rolling_flex,
+                       formula = mod_form_3))
+
+rmse_3_models %>% 
+  summarise(mean_rmse_model_1 = mean(model_1_rmse), 
+            mean_rmse_model_2 = mean(model_2_rmse), 
+            mean_rmse_model_3 = mean(model_3_rmse))
+
+```
+
+
+The choice is to go with model 3. Now we need to extract the parameters. Shall we go with the most recent? Or the lowest RMSE? I prefer most recent. 
+
+```{r}
+ff_chosen <- function(split, formula) {
+  
+  split_for_data <- analysis(split)
+  
+  ff_model <- lm(formula, data = split_for_data)
+  
+  ff_model
+  
+}
+
+chosen_model_results <- 
+rolling_origin_spy_2013_2017 %>% 
+  mutate(chosen_model = map(rolling_origin_spy_2013_2017$splits,
+                       ff_chosen,
+                       formula = mod_form_3)) 
+
+chosen_model_results %>% 
+  tail() 
+  
+saved_model <- 
+  lm(returns ~ MKT + SMB + HML + RMW + CMA, data = analysis(rolling_origin_spy_2013_2017$splits[[1150]]))   
+
+
+spy_2018 %>% 
+  select(returns) %>% 
+  mutate(preds = 
+    predict(saved_model, newdata = spy_2018)) %>% 
+  tail()
+
+
+```
+
+
+Try with Parsnip
+
+
+```{r}
+lm_model <-
+  linear_reg() %>%
+  set_engine("lm") %>%
+  fit(returns ~ MKT + SMB + HML + RMW + CMA, 
+      data = analysis(rolling_origin_spy_2013_2017$splits[[1150]]))
+
+pred_spy <-
+  spy_2018 %>%
+  select(-prices)
+
+predict(lm_model, new_data = pred_spy) %>% 
+  tail()
+
+```
+
+
+```{r}
+my_lm <- function(split, id){
+    
+    analysis_set_lm <- analysis(split)
+    
+    model_lm <- 
+      linear_reg(mode = "regression") %>%
+      set_engine("lm") %>%
+      fit(returns ~ MKT + SMB + HML, data = analysis_set_lm) 
+
+    assessment_set_lm <- assessment(split)
+    
+
+    assessment_set_lm %>% 
+      select(returns) %>% 
+      mutate(id = id) %>% 
+      bind_cols(predict(model_lm, new_data = assessment_set_lm))
+}
+
+lm_example <- map2_df(.x = rolling_origin_spy_2013_2017$splits,
+                      .y = rolling_origin_spy_2013_2017$id,
+                      ~my_lm(split = .x, id = .y))
+
+lm_example %>%
+  group_by(id) %>% 
+  group_nest() %>% 
+  mutate(start_date = map(rolling_origin_spy_2013_2017$splits, get_start_date) %>% reduce(c)) %>%
+  select(start_date, everything())
+```
+
+```{r}
+lm_example %>%
+    group_by(id) %>%
+    rmse(returns, .pred) %>%
+    mutate(start_date = map(rolling_origin_spy_2013_2017$splits, get_start_date) %>% reduce(c)) %>%
+    summarise(mean_rmse = mean(.estimate)) %>%
+    pull()
+```
+
+
+
+```{r}
+
+
+my_rf <- function(mtry = 3, trees = 5, split, id){
+    
+    analysis_set <- analysis(split)
+    
+    model <- 
+      rand_forest(mtry = mtry, trees = trees) %>%
+        set_engine("ranger", importance = 'impurity') %>%
+        fit(returns ~ MKT + SMB + HML, data = analysis_set)
+
+    assessment_set <- assessment(split)
+  
+
+    assessment_set %>% 
+      select(returns) %>% 
+      mutate(id = id) %>% 
+      bind_cols(predict(model, new_data = assessment_set))
+}
+
+my_lm <- function(split, id){
+    
+    analysis_set <- analysis(split)
+    
+    model <- 
+      linear_reg() %>%
+      set_engine("lm") %>%
+      fit(returns ~ MKT + SMB + HML, data = analysis_set) 
+
+    assessment_set <- assessment(split)
+    
+
+    assessment_set %>% 
+      select(returns) %>% 
+      mutate(id = id) %>% 
+      bind_cols(predict(model, new_data = assessment_set))
+}
+
+results_example <- map2_df(.x = rolling_origin_spy_2013_2017$splits,
+                           .y = rolling_origin_spy_2013_2017$id,
+                           ~my_rf(mtry = 3, trees = 5, split = .x, id = .y))
+
+results_example %>% 
+  mutate(start_date = map(rolling_origin_spy_2013_2017$splits, get_start_date) %>% reduce(c)) %>%
+  select(start_date, everything())
+
+results_example %>%
+    group_by(id) %>%
+    rmse(truth, prediction) %>%
+    summarise(mean_rmse = mean(.estimate)) %>%
+    pull()
+
+get_start_date <- function(x) 
+  min(assessment(x)$date)
+```
+
+
+
+```{r}
+mycontrol <- trainControl(method = "timeslice",
+                          initialWindow = 100,
+                          horizon = 1,
+                          fixedWindow = TRUE, 
+                          savePredictions = TRUE)
+
+data_joined_tidy %>% 
+  filter(asset == "EEM") -> eem_for_model
+
+three_factor_model <- 
+  train(returns ~ MKT + SMB + HML,
+               data = eem_for_model,
+               method = "lm",
+               metric = "RMSE",
+               trControl = mycontrol)
+
+#three_factor_model$pred %>% 
+ # head()
+
+three_factor_model
+
+five_factor_model <- train(returns ~ MKT + SMB + HML + RMW + CMA,
+               data = eem_for_model,
+               method = "lm",
+               metric = "RMSE",
+               trControl = mycontrol)
+
+#three_factor_model$pred %>% 
+ # head()
+five_factor_model
+broom::augment(five_factor_model$finalModel)
+```
+
+
+
+```{r}
+
+date_for_pred <-
+eem_for_model %>%  
+  slice(c(101:n())) %>%
+  ungroup() %>% 
+  pull(date)
+
+predictions_for_plot <- 
+  myfit$pred %>% 
+  add_column( date = date_for_pred) %>% 
+  mutate(date = ymd(date))
+
+predictions_for_plot %>% 
+  select(pred, obs, date) %>% 
+  gather(type, value, -date) %>% 
+  ggplot(aes(x = date, y = value, color = type)) + 
+  geom_line()
+```
+
+
+
+```{r}
+  
+## Create split of data
+set.seed(955)
+#ctrl <- rsample::vfold_cv(Sacramento, v = 10, repeats = 1, strata = NULL)
+  
+# define  model object
+get_svm_model <- function(data){
+  svm_rbf(mode = "regression", cost = 10^(param[2]), rbf_sigma = 10^(param[2]))%>%
+  set_engine("kernlab") %>%
+  fit(price ~ ., data = data)
+  }
+
+get_preds <- function(asses_dat, model_obj, ...) {
+  price <- asses_dat %>% select(price)
+  pred <- predict(model_obj, new_data = asses_dat %>% select(-price))
+  cbind(price, pred)
+}
+
+asses_model <- ctrl %>% 
+  mutate(asses = map(.$splits, assessment)) %>% 
+  mutate(anal = map(.$splits, analysis)) %>% 
+  mutate(svm_mod = map(anal, get_svm_model)) %>% 
+  mutate(svm_pred = map2(asses, svm_mod, get_preds))
+
+map_df(asses_model$svm_pred, yardstick::mae, price, .pred) %>% 
+  summarise(mean(.estimate)) %>% 
+  pull()
+
+```
+
+

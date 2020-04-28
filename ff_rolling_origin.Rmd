@@ -1,0 +1,346 @@
+---
+title: "Rolling Origins and Fama French"
+output: html_notebook
+---
+
+```{r setup, include = FALSE, message = FALSE, warning = FALSE}
+
+# packages required for this post
+for (pkg in c('tidyquant', 'tidyverse', 'timetk', 'tibbletime', 'broom', 'rsample', 'yardstick', 'scales')) 
+  if (!requireNamespace(pkg)) install.packages(pkg)
+
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, comment= NA)
+```
+
+Today we continue our work on sampling so that we can run models on subsets of our data and then test the accuracy of the models on data not included in those subsets. In the machine learning prediction world, that's often called our `training` data and our `testing` data, but we're not going to do any machine learning prediction today. We'll stay with our good'ol Fama French regression models for the reasons explained last time: the goal is to explore a new of sampling our data and I prefer to do that in the context of a familiar model and data set. In 2019, we'll start expaning our horizons to different models and data, but for today it's more of a tools exploration. 
+
+Loyal readers of this blog (if that's you, thank you!) will remember that we undertook a similar project in the [previous post](https://rviews.rstudio.com/2018/12/13/rsampling-fama-french/), when we used k-fold cross-validation. Today, we will use rolling origin sampling of the data, which differs from k-fold cross-validation in the sense that with rolling origin we explicitly sample based on the dates of our observation. With rolling origin, our first sample starts on the first day, our second sample starts on the second day, our third sample starts on third day. Or, we could have the second sample start on the twentieth day, or we could have it start again on the first day and just include an extra day. Either way, we are aware of the order of our data when sampling. With k-fold cross-validation, we were randomly shuffling and then selecting observations. This distinction can be particularly important for economic time series where we believe that the order of our observations is important. 
+
+Let's get to it. 
+
+First, we need our data and, as usual, we'll import data for daily prices of 5 ETFs, convert them to returns (have a look [here](http://www.reproduciblefinance.com/2017/09/25/asset-prices-to-log-returns/) for a refresher on that code flow), then import the 5 Fama French factor data and join it to our 5 ETF returns data. Here's the code to make that happen (this code was covered in detail in [this post](http://www.reproduciblefinance.com/2018/06/07/fama-french-write-up-part-one/): 
+
+
+```{r}
+library(tidyverse)
+library(tidyquant)
+library(rsample)
+library(broom)
+library(timetk)
+
+symbols <- c("SPY", "EFA", "IJS", "EEM", "AGG")
+
+
+# The prices object will hold our daily price data.
+prices <- 
+  getSymbols(symbols, src = 'yahoo', 
+             from = "2012-12-31",
+             to = "2017-12-31",
+             auto.assign = TRUE, 
+             warnings = FALSE) %>% 
+  map(~Ad(get(.))) %>% 
+  reduce(merge) %>%
+  `colnames<-`(symbols)
+
+
+asset_returns_long <-  
+  prices %>% 
+  tk_tbl(preserve_index = TRUE, rename_index = "date") %>%
+  gather(asset, returns, -date) %>% 
+  group_by(asset) %>%  
+  mutate(returns = (log(returns) - log(lag(returns)))) %>% 
+  na.omit()
+
+factors_data_address <- 
+"http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Global_5_Factors_Daily_CSV.zip"
+
+factors_csv_name <- "Global_5_Factors_Daily.csv"
+
+temp <- tempfile()
+
+download.file(
+  # location of file to be downloaded
+  factors_data_address,
+  # where we want R to store that file
+  temp, 
+  quiet = TRUE)
+
+
+Global_5_Factors <- 
+  read_csv(unz(temp, factors_csv_name), skip = 6 ) %>%
+  rename(date = X1, MKT = `Mkt-RF`) %>%
+  mutate(date = ymd(parse_date_time(date, "%Y%m%d")))%>%
+  mutate_if(is.numeric, funs(. / 100)) %>% 
+  select(-RF)
+
+data_joined_tidy <- 
+  asset_returns_long %>%
+  left_join(Global_5_Factors, by = "date") %>% 
+  na.omit()
+```
+
+After running that code, we have an object called `data_joined_tidy`. It holds daily returns for 5 ETFs and the Fama French factors. Here's a look at the first row for each ETF rows.
+
+```{r}
+data_joined_tidy %>% 
+  slice(1)
+```
+
+For today, let's work with just the daily returns of EEM. 
+
+```{r}
+eem_for_roll <- data_joined_tidy %>% 
+  filter(asset == "EEM")
+```
+
+We are going to regress those EEM daily returns on the Fama French factors and need a way to measure the accuracy of our various factor models. In [this post](http://www.reproduciblefinance.com/2018/11/26/many-factor-models/), we measured our models by looking at the adjusted R-squareds, when the models were run on the entirety of the data. Last time, we use k-fold cross-validation to split the data into a bunch of subsets, then ran our model on the subsets and measured the accuracy against the holdouts from the subsets. Now, let's use the `rolling_origin()` function from `rsample` to split our data into `analysis` and `assessment` sets in a time-aware way, then calculate RMSEs. 
+
+The `rolling_origin()` function needs a few arguments set. We first set `data` to be `eem_for_roll` Then we assign `initial` to be `50` - this tells the function that the size of our first sample is 50 days. Our first chunk of `analysis` data will be the first 50 days of EEM returns. Next we assign `assess` to be `5` - this tells the function that our `assessment` data is the 5 days of EEM returns following those first 50 days. Finally, we set `cumulative` to be `FALSE` - this tells the functions that each of splits is a 50 days. The first split is the first 50 days, starting on day 1 and ending on day 50. The next split starts on day 2 and ends on day 51. If we were to set `cumulative = TRUE`, the first split would be 50 days. The next split would be 51 days, the next split would be 52 days. And so on. The `analysis` split days would be accumulating. For now, we will leave it at `cumulative = FALSE`. 
+
+For that reason, we will append `_sliding` to the name of our object because the start of our window will slide each time. 
+
+
+```{r}
+library(rsample)
+
+roll_eem_sliding <- 
+ rolling_origin(
+  data       = eem_for_roll,
+  initial    = 50,
+  assess     = 10,
+  cumulative = FALSE
+)
+
+```
+
+Look at an individual split.
+
+```{r}
+one_eem_split <- 
+  roll_eem_sliding$splits[[1]]
+
+one_eem_split
+```
+
+That `50` is telling us there are 50 days or rows in the `analysis` set; that `10` is telling us that there are 10 rows in our `assessment` data - we'll see how well our model predicts the return 5 days after the last observation in our data.
+
+Here is the `analysis` subset of that split.
+
+```{r}
+analysis(one_eem_split) %>% 
+  head()
+```
+
+And the `assessment` subset - this is 10 rows.
+
+```{r}
+assessment(one_eem_split)
+
+```
+
+By way of comparison, here's what the k-fold cross-validated data would look like. 
+
+```{r}
+cved_eem <- 
+  vfold_cv(eem_for_roll, v = 5)
+
+assessment(cved_eem$splits[[1]]) %>% 
+  head()
+```
+
+Notice how the first date is not necessarily the first date in our data. In fact, if you run that code chunk a few times, the first date will be randomly selected. For me, it varied between January 2nd and January 15th. 
+
+Back to our `rolling_origin` data, we know that split 1 begins on day 1 and ends on day 50:
+
+
+```{r}
+analysis(roll_eem_sliding$splits[[1]]) %>% 
+  slice(c(1,50))
+```
+
+And we know split 2 begins on day 2 and ends on day 51:
+
+```{r}
+analysis(roll_eem_sliding$splits[[2]]) %>% 
+  slice(c(1,50))
+```
+
+Now we can start using our data to fit and then assess our model. The code flow is very similar to our previous post, but I'll go ahead and run through it anyway. 
+
+First, let's create a function that takes a split as an argument, fits a 3-factor FF model and calculates the root mean squared error. We will use the `rmse()` function from `yardstick` to measure our model. RMSE stands for root mean-squared error. It's the sum of the squared differences between our fitted values and the actual values in the `assessment` data. A lower RMSE is better! 
+
+
+```{r}
+library(yardstick)
+
+ff_three_rmse <- function(split){
+  analysis_set <- analysis(split) 
+  
+  ff_model <- lm(returns ~ MKT + SMB + HML  , data = analysis_set)
+  
+  holdout <- assessment(split)
+  
+  rmse <-
+    ff_model %>%
+    augment(newdata = holdout) %>%
+    rmse(returns, .fitted) %>%
+    pull(.estimate)
+}
+```
+
+Let's pass our one split object `one_eem_split` to the function.
+
+```{r}
+
+ff_three_rmse(one_eem_split) %>% 
+  print()
+
+```
+
+Now we can use `mutate()` and `map_dbl()` to pass all of our splits held in `roll_eem_sliding` to the function. This will return an `rmse` for this model when applied to each of our rolling origin splits. This takes a few seconds to run.
+
+```{r}
+rmse_one_model <- 
+  roll_eem_sliding %>% 
+  mutate(model = map_dbl(
+    .x = splits,
+    .f = ~(ff_three_rmse(.x))))
+
+rmse_one_model %>% 
+  head()
+```
+
+Same as we did last time, now let's get functional. We will define three models, the ones that we wish to test with via our rolling origin splits and RMSE, then pass those models to one function. 
+
+First, we use `as.formula()` to define our three models. 
+
+```{r}
+mod_form_1 <- as.formula(returns ~ MKT)
+mod_form_2 <- as.formula(returns ~ MKT + SMB + HML)
+mod_form_3 <- as.formula(returns ~ MKT + SMB + HML + RMW + CMA)
+```
+
+Now we write one function that takes `split` as an argument, same as above, but also takes `formula` as an argument, so we can pass it different models.  This gives us the flexibility to more easily define new models and pass them to `map` so I'll append `_flex` to the name of this function.
+
+```{r}
+
+ff_rolling_flex <- function(split, formula) {
+  
+  split_for_data <- analysis(split)
+  
+  ff_model <- lm(formula, data = split_for_data)
+  
+  holdout <- assessment(split)
+  rmse <-
+    ff_model %>%
+    augment(newdata = holdout) %>%
+    rmse(returns, .fitted) %>%
+    pull(.estimate)
+  
+}
+
+
+rmse_model_1_flex <- 
+  roll_eem_sliding %>% 
+  mutate(model_1_rmse = map_dbl(roll_eem_sliding$splits,
+                       ff_rolling_flex,
+                       formula = mod_form_1))  
+
+rmse_model_1_flex %>% 
+  head()
+```
+
+Same as last time, we can run all of our models using the `mutate()` and `map_dbl` combination. Warning, this one takes a bit of time and compute to run - proceed with caution if you're on a desktop.
+
+```{r}
+rmse_3_models <- 
+  roll_eem_sliding %>% 
+  mutate(model_1_rmse = map_dbl(roll_eem_sliding$splits,
+                       ff_rolling_flex,
+                       formula = mod_form_1),
+         model_2_rmse = map_dbl(roll_eem_sliding$splits,
+                       ff_rolling_flex,
+                       formula = mod_form_2),
+         model_3_rmse = map_dbl(roll_eem_sliding$splits,
+                       ff_rolling_flex,
+                       formula = mod_form_3))
+
+rmse_3_models %>% 
+  head()
+```
+
+
+Alright, we have our RMSE, from each of our 3 models, as applied to each of our splits. 
+
+Thus far, our substantive flow is very similar to our k-fold sv work. Now, though, we can take advantage of the time aware nature of our splits.
+
+Let's visualize how our rmse has changed over different time aware splits, for our various models.
+Remember, we know the exact start and end date for our `analysis` and `assessment` sets, so we can extract the date of, say the first observation in the `assessment` data and assign it to the split. We can consider this the date of that model run. 
+
+First, let's create a function to extract the first date of each of our `assessment` sets.
+
+```{r}
+get_start_date <- function(x) 
+  min(assessment(x)$date)
+```
+
+Here's how that works on our one split object. 
+
+```{r}
+get_start_date(one_eem_split)
+```
+
+That's the first date in the assessment data: 
+
+```{r}
+assessment(one_eem_split) %>% 
+  select(date) %>% 
+  slice(1)
+```
+
+Now we want to add a column to our `results_3` object called `start_date`. We'll use our usual `mutate()` and then `map()` flow to apply the `get_start_date()` function to each of our splits, but we'll need to pipe the result to `reduce(c)` to coerce the result to a date. `map()` returns a list by default and we want a vector of dates. 
+
+```{r}
+rmse_3_models_with_start_date <-
+  rmse_3_models %>%
+  mutate(start_date = map(roll_eem_sliding$splits, get_start_date) %>% reduce(c)) %>%
+  select(start_date, everything())
+
+rmse_3_models_with_start_date %>% 
+  head()
+```
+Now we can head to `ggplot` for some visualizing. I'd like to plot all of my RMSE's in different colors and the best way to do that is to `gather()` this data to tidy format, with a column called `model` and a column called `value`. It's necessary to coerce to a data frame first, using `as.data.frame()`.
+
+```{r}
+rmse_3_models_with_start_date %>%
+  as.data.frame() %>% 
+  select(-splits, -id) %>% 
+  gather(model, value, -start_date) %>% 
+  head()
+```
+
+Now we can use some of our familiar `ggplot` methods to plot our RMSEs over time, and see if we notice this model degrading or improving in different periods.
+
+```{r}
+rmse_3_models_with_start_date %>%
+  as.data.frame() %>% 
+  select(-splits, -id) %>% 
+  gather(model, value, -start_date) %>% 
+  ggplot(aes(x = start_date, y = value, color = model)) +
+  geom_point() +
+  facet_wrap(~model, nrow = 2) +
+  scale_x_date(breaks = scales::pretty_breaks(n = 10)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+All of the models have a jump in RMSE, meaning they performed worse, around the end of 2017. We aren't focused on the theory of these models today but if we were, this would be a good place to start investigating. This is just the beginning of our exploration of `rolling_origin` but I love how it opens the door for ways to think about visualzing our models.
+
+And, finally, those same public service announcements from last time are still live, so I'll mention them one more time. 
+
+First, thanks to everyone who has checked out my new book! The price just got lowered for the holidays. See on [Amazon](https://www.amazon.com/Reproducible-Finance-Portfolio-Analysis-Chapman/dp/1138484032) or on the [CRC homepage](https://www.crcpress.com/Reproducible-Finance-with-R-Code-Flows-and-Shiny-Apps-for-Portfolio-Analysis/Jr/p/book/9781138484030) (okay, that was more of an announcement about my book).
+
+Second, applications are open for the [Battlefin](https://www.battlefin.com/) alternative data contest and RStudio is one of the tools you can use to analyze the data. Check it out [here](www.alternativedatacombine.com). They'll announce 25 finalists in January who will get to compete for a cash prize and connect with some quant hedge funds. Go get'em! 
+
+Lastly, a special thanks to [Bruce Fox](https://www.linkedin.com/in/bruce-fox-98504612/) who suggested we might want to expand on the Monte Carlo simulation in [the book](https://www.amazon.com/Reproducible-Finance-Portfolio-Analysis-Chapman/dp/1138484032) to take account of different distributions implied by historical returns and different market regimes that might arise. Today's rolling origin framework will also lay the foundation, I hope, for implementing some of Bruce's ideas in January.
+
+Thanks for reading and see you next time.
